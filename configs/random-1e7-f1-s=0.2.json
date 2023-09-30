@@ -1,0 +1,8 @@
+{
+  "dataset": "random",
+  "min_points": 10000000,
+  "max_points": 10000000,
+  "num_features": 1,
+  "size": 1000,
+  "sparsity": 0.2
+}

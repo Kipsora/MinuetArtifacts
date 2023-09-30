@@ -1,0 +1,516 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+new file mode 100644
+index 0000000..db7de88
+--- /dev/null
++++ b/CMakeLists.txt
+@@ -0,0 +1,86 @@
++cmake_minimum_required(VERSION 3.19)
++project(torchsparse)
++
++set(CMAKE_CXX_STANDARD 17)
++set(CMAKE_CUDA_STANDARD 17)
++set(CMAKE_CXX_STANDARD_REQUIRED TRUE)
++set(CMAKE_CUDA_STANDARD_REQUIRED TRUE)
++
++set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra")
++set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -lineinfo")
++set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3")
++set(CMAKE_CUDA_FLAGS_RELEASE "${CMAKE_CUDA_FLAGS_RELEASE} -O3 -Xptxas -O3 -lineinfo")
++
++set(Python_USE_STATIC_LIBS FALSE)
++set(Python_FIND_VIRTUALENV FIRST)
++find_package(Python COMPONENTS Interpreter Development REQUIRED)
++
++execute_process(
++        COMMAND ${Python_EXECUTABLE} "${PROJECT_SOURCE_DIR}/utils/gather_build_info.py"
++        OUTPUT_VARIABLE TORCHSPARSE_BUILD_INFO
++        OUTPUT_STRIP_TRAILING_WHITESPACE)
++string(REPLACE "\n" ";" TORCHSPARSE_BUILD_INFO ${TORCHSPARSE_BUILD_INFO})
++list(GET TORCHSPARSE_BUILD_INFO 0 PYBIND11_CMAKE_PREFIX_PATH)
++list(GET TORCHSPARSE_BUILD_INFO 1 TORCH_CMAKE_PREFIX_PATH)
++list(GET TORCHSPARSE_BUILD_INFO 2 TORCH_CUDA_AVAILABLE)
++list(GET TORCHSPARSE_BUILD_INFO 3 TORCH_CUDA_MAJOR_VERSION)
++
++if (TORCH_CUDA_AVAILABLE STREQUAL "True" OR "$ENV{TORCHSPARSE_ENABLE_CUDA}" STREQUAL "1")
++    set(ENABLE_CUDA ON CACHE BOOL "Whether to enable CUDA" FORCE)
++else ()
++    set(ENABLE_CUDA OFF CACHE BOOL "Whether to enable CUDA" FORCE)
++endif ()
++
++if (ENABLE_CUDA)
++    if (DEFINED ENV{CUDA_TOOLKIT_ROOT})
++        set(CUDAToolkit_ROOT $ENV{CUDA_TOOLKIT_ROOT})
++    endif ()
++    find_package(CUDAToolkit ${TORCH_CUDA_MAJOR_VERSION} EXACT REQUIRED)
++    if (DEFINED ENV{TORCHSPARSE_CUDA_ARCH_LIST})
++        set(TORCH_CUDA_ARCH_LIST $ENV{TORCHSPARSE_CUDA_ARCH_LIST})
++    endif ()
++endif ()
++
++list(APPEND CMAKE_PREFIX_PATH "${TORCH_CMAKE_PREFIX_PATH}")
++find_package(Torch PATHS ${TORCH_CMAKE_PREFIX_PATH} NO_DEFAULT_PATH REQUIRED)
++find_library(TORCH_PYTHON_LIBRARY torch_python PATHS "${TORCH_INSTALL_PREFIX}/lib" NO_DEFAULT_PATH REQUIRED)
++if (PYBIND11_CMAKE_PREFIX_PATH EQUAL "None")
++    find_package(pybind11 REQUIRED CONFIG)
++else ()
++    list(APPEND CMAKE_PREFIX_PATH "${PYBIND11_CMAKE_PREFIX_PATH}")
++    find_package(pybind11 PATHS ${PYBIND11_CMAKE_PREFIX_PATH} NO_DEFAULT_PATH REQUIRED CONFIG)
++endif ()
++
++find_package(OpenMP REQUIRED)
++
++file(GLOB_RECURSE TORCHSPARSE_HEADERS "${CMAKE_CURRENT_SOURCE_DIR}/torchsparse/backend/*/**.h")
++file(GLOB_RECURSE TORCHSPARSE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/torchsparse/backend/*/**.cpp")
++if (ENABLE_CUDA)
++    file(GLOB_RECURSE TORCHSPARSE_CUDA_HEADERS "${CMAKE_CURRENT_SOURCE_DIR}/torchsparse/backend/*/**.cuh")
++    file(GLOB_RECURSE TORCHSPARSE_CUDA_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/torchsparse/backend/*/**.cu")
++    list(APPEND TORCHSPARSE_HEADERS ${TORCHSPARSE_CUDA_HEADERS})
++    list(APPEND TORCHSPARSE_SOURCES ${TORCHSPARSE_CUDA_SOURCES})
++    list(APPEND TORCHSPARSE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/torchsparse/backend/pybind_cuda.cpp")
++else()
++    list(APPEND TORCHSPARSE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/torchsparse/backend/pybind_cpu.cpp")
++endif ()
++
++# add the TORCHSPARSE package
++pybind11_add_module(torchsparse "${TORCHSPARSE_HEADERS}" "${TORCHSPARSE_SOURCES}")
++if (ENABLE_CUDA)
++    target_include_directories(torchsparse PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
++    #    find_package(CUDAToolkit "${TORCH_CUDA_MAJOR_VERSION}" EXACT REQUIRED)
++    target_link_libraries(torchsparse PUBLIC OpenMP::OpenMP_CXX CUDA::cublas)
++else ()
++    target_include_directories(torchsparse PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
++    target_link_libraries(torchsparse PUBLIC OpenMP::OpenMP_CXX)
++endif ()
++set_target_properties(torchsparse PROPERTIES POSITION_INDEPENDENT_CODE ON)
++
++# add the pybind11 interface
++if (NOT DEFINED TORCH_EXTENSION_NAME)
++    message(FATAL_ERROR "TORCH_EXTENSION_NAME must be defined by \"cmake -DTORCH_EXTENSION_NAME=<name of the extension>\"")
++endif ()
++target_link_libraries(torchsparse PRIVATE ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIBRARY} Python::Python)
++target_compile_definitions(torchsparse PRIVATE -DTORCH_EXTENSION_NAME=${TORCH_EXTENSION_NAME})
++set_target_properties(torchsparse PROPERTIES OUTPUT_NAME ${TORCH_EXTENSION_NAME})
+diff --git a/setup.py b/setup.py
+index 299f005..6f11042 100644
+--- a/setup.py
++++ b/setup.py
+@@ -1,41 +1,133 @@
+-import glob
+ import os
++import re
++import subprocess
++import sys
++from pathlib import Path
+ 
+-import torch
+-import torch.cuda
+-from setuptools import find_packages, setup
+-from torch.utils.cpp_extension import (CUDA_HOME, BuildExtension, CppExtension,
+-                                       CUDAExtension)
++from setuptools import Extension, setup
++from setuptools import find_packages
++from setuptools.command.build_ext import build_ext
+ 
+ from torchsparse import __version__
+ 
+-if ((torch.cuda.is_available() and CUDA_HOME is not None)
+-        or (os.getenv('FORCE_CUDA', '0') == '1')):
+-    device = 'cuda'
+-else:
+-    device = 'cpu'
+-
+-sources = [os.path.join('torchsparse', 'backend', f'pybind_{device}.cpp')]
+-for fpath in glob.glob(os.path.join('torchsparse', 'backend', '**', '*')):
+-    if ((fpath.endswith('_cpu.cpp') and device in ['cpu', 'cuda'])
+-            or (fpath.endswith('_cuda.cu') and device == 'cuda')):
+-        sources.append(fpath)
+-
+-extension_type = CUDAExtension if device == 'cuda' else CppExtension
+-extra_compile_args = {
+-    'cxx': ['-g', '-O3', '-fopenmp', '-lgomp'],
+-    'nvcc': ['-O3']
++# Convert distutils Windows platform specifiers to CMake -A arguments
++PLAT_TO_CMAKE = {
++    "win32": "Win32",
++    "win-amd64": "x64",
++    "win-arm32": "ARM",
++    "win-arm64": "ARM64",
+ }
+ 
++
++# A CMakeExtension needs a sourcedir instead of a file list.
++# The name must be the _single_ output extension from the CMake build.
++# If you need multiple extensions, see scikit-build.
++class CMakeExtension(Extension):
++    def __init__(self, name: str, sourcedir: str = "") -> None:
++        super().__init__(name, sources=[])
++        self.sourcedir = os.fspath(Path(sourcedir).resolve())
++
++
++class CMakeBuild(build_ext):
++    def build_extension(self, ext: CMakeExtension) -> None:
++        # Must be in this form due to bug in .resolve() only fixed in Python 3.10+
++        ext_fullpath = Path.cwd() / self.get_ext_fullpath(ext.name)  # type: ignore[no-untyped-call]
++        extdir = ext_fullpath.parent.resolve()
++
++        # Using this requires trailing slash for auto-detection & inclusion of
++        # auxiliary "native" libs
++
++        debug = int(os.environ.get("DEBUG", 0)) if self.debug is None else self.debug
++        cfg = "Debug" if debug else "Release"
++
++        # CMake lets you override the generator - we need to check this.
++        # Can be set with Conda-Build, for example.
++        cmake_generator = os.environ.get("CMAKE_GENERATOR", "")
++
++        # Set Python_EXECUTABLE instead if you use PYBIND11_FINDPYTHON
++        # EXAMPLE_VERSION_INFO shows you how to pass a value into the C++ code
++        # from Python.
++        cmake_args = [
++            f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={extdir}{os.sep}",
++            f"-DPython_EXECUTABLE={sys.executable}",
++            f"-DCMAKE_BUILD_TYPE={cfg}",  # not used on MSVC, but no harm
++            f"-DTORCH_EXTENSION_NAME={ext.name.split('.')[-1]}"
++        ]
++        build_args = []
++        # Adding CMake arguments set as environment variable
++        # (needed e.g. to build for ARM OSx on conda-forge)
++        if "CMAKE_ARGS" in os.environ:
++            cmake_args += [item for item in os.environ["CMAKE_ARGS"].split(" ") if item]
++
++        if self.compiler.compiler_type != "msvc":
++            # Using Ninja-build since it a) is available as a wheel and b)
++            # multithreads automatically. MSVC would require all variables be
++            # exported for Ninja to pick it up, which is a little tricky to do.
++            # Users can override the generator with CMAKE_GENERATOR in CMake
++            # 3.15+.
++            if not cmake_generator or cmake_generator == "Ninja":
++                try:
++                    import ninja  # noqa: F401
++
++                    ninja_executable_path = Path(ninja.BIN_DIR) / "ninja"
++                    cmake_args += [
++                        "-GNinja",
++                        f"-DCMAKE_MAKE_PROGRAM:FILEPATH={ninja_executable_path}",
++                    ]
++                except ImportError:
++                    pass
++        else:
++            # Single config generators are handled "normally"
++            single_config = any(x in cmake_generator for x in {"NMake", "Ninja"})
++
++            # CMake allows an arch-in-generator style for backward compatibility
++            contains_arch = any(x in cmake_generator for x in {"ARM", "Win64"})
++
++            # Specify the arch if using MSVC generator, but only if it doesn't
++            # contain a backward-compatibility arch spec already in the
++            # generator name.
++            if not single_config and not contains_arch:
++                cmake_args += ["-A", PLAT_TO_CMAKE[self.plat_name]]
++
++            # Multi-config generators have a different way to specify configs
++            if not single_config:
++                cmake_args += [
++                    f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY_{cfg.upper()}={extdir}"
++                ]
++                build_args += ["--config", cfg]
++
++        if sys.platform.startswith("darwin"):
++            # Cross-compile support for macOS - respect ARCHFLAGS if set
++            archs = re.findall(r"-arch (\S+)", os.environ.get("ARCHFLAGS", ""))
++            if archs:
++                cmake_args += ["-DCMAKE_OSX_ARCHITECTURES={}".format(";".join(archs))]
++
++        # Set CMAKE_BUILD_PARALLEL_LEVEL to control the parallel build level
++        # across all generators.
++        if "CMAKE_BUILD_PARALLEL_LEVEL" not in os.environ:
++            # self.parallel is a Python 3 only way to set parallel jobs by hand
++            # using -j in the build_ext call, not supported by pip or PyPA-build.
++            if hasattr(self, "parallel") and self.parallel:
++                # CMake 3.12+ only.
++                build_args += [f"-j{self.parallel}"]
++
++        build_temp = Path(self.build_temp) / ext.name
++        if not build_temp.exists():
++            build_temp.mkdir(parents=True)
++
++        subprocess.run(
++            ["cmake", ext.sourcedir] + cmake_args, cwd=build_temp, check=True
++        )
++        subprocess.run(
++            ["cmake", "--build", "."] + build_args, cwd=build_temp, check=True
++        )
++
++
+ setup(
+     name='torchsparse',
+     version=__version__,
+     packages=find_packages(),
+-    ext_modules=[
+-        extension_type('torchsparse.backend',
+-                       sources,
+-                       extra_compile_args=extra_compile_args)
+-    ],
+-    cmdclass={'build_ext': BuildExtension},
++    ext_modules=[CMakeExtension("torchsparse.backend")],
++    cmdclass={'build_ext': CMakeBuild},
+     zip_safe=False,
+ )
+diff --git a/torchsparse/backend/convolution/convolution_cuda.cu b/torchsparse/backend/convolution/convolution_cuda.cu
+index 6dff868..e1339e3 100644
+--- a/torchsparse/backend/convolution/convolution_cuda.cu
++++ b/torchsparse/backend/convolution/convolution_cuda.cu
+@@ -304,9 +304,15 @@ at::Tensor convolution_forward_cuda(
+     // std::cout << "not fallback: " << buffer_size * (in_feat.size(1) +
+     // out_feat.size(1)) << " " << global_buffer.size(0) << std::endl;
+     //  global buffer large enough, do all gather / all scatter
+-    return convolution_forward_cuda_latest(
+-        in_feat, kernel, neighbor_map, neighbor_offset, input_mask, output_mask,
+-        output_size, epsilon, mm_thresh, conv_mode, transpose, global_buffer);
++    try {
++      return convolution_forward_cuda_latest(
++          in_feat, kernel, neighbor_map, neighbor_offset, input_mask, output_mask,
++          output_size, epsilon, mm_thresh, conv_mode, transpose, global_buffer);
++    } catch (std::runtime_error) {
++      return convolution_forward_cuda_fallback(in_feat, kernel, neighbor_map,
++                                              output_size, conv_mode,
++                                              neighbor_offset, transpose);
++    }
+   }
+ }
+ 
+@@ -521,6 +527,9 @@ at::Tensor convolution_forward_cuda_latest(
+   group_strategy_generation(kernel_volume, epsilon, mm_thresh, conv_mode,
+                             neighbor_offset, precompute_mid, groups, mm_ops,
+                             group_sizes, cum_buffer_sizes, buffer_size);
++  if (buffer_size * (n_in_channels + n_out_channels) > global_buffer.size(0)) {
++    throw std::runtime_error("");
++  }
+   at::Tensor cum_buffer_sizes_gpu =
+       cum_buffer_sizes.to(neighbor_offset_cum_gpu.device());
+ 
+@@ -790,7 +799,7 @@ at::Tensor convolution_forward_cuda_fallback(
+     // gemm: (i, c) X (c, o) = (i, o)
+     int kmap_idx = i;
+     if (conv_mode == 2) {
+-      kmap_idx = i < mid_kernel ? i * 2 : (kernel_volume - i) * 2 - 1;
++      kmap_idx = i < mid_kernel ? i * 2 : (kernel_volume - i - 1) * 2 - 1;
+     }
+     torch::mm_out(out_buffer_activated, in_buffer_activated, kernel[kmap_idx]);
+     // scatter n_active_feats dense features into n_out_feats output features of
+diff --git a/torchsparse/backend/others/query_cuda.cu b/torchsparse/backend/others/query_cuda.cu
+index cd01600..04a83e5 100644
+--- a/torchsparse/backend/others/query_cuda.cu
++++ b/torchsparse/backend/others/query_cuda.cu
+@@ -1,11 +1,76 @@
+ #include <torch/torch.h>
+ 
+ #include <cmath>
+-#include <iostream>
+ #include <vector>
+ 
+ #include "../hashmap/hashmap_cuda.cuh"
+ 
++struct HashTable {
++  std::unique_ptr<CuckooHashTableCuda_Multi> table;
++  at::Tensor key;
++  at::Tensor val;
++};
++
++void *acquire_hash_table(const at::Tensor hash_target,
++                         const at::Tensor idx_target) {
++  int n = hash_target.size(0);
++  const int nextPow2 = pow(2, ceil(log2((double)n)));
++  // When n is large, the hash values tend to be more evenly distrubuted and
++  // choosing table_size to be 2 * nextPow2 typically suffices. For smaller n,
++  // the effect of uneven distribution of hash values is more pronounced and
++  // hence we choose table_size to be 4 * nextPow2 to reduce the chance of
++  // bucket overflow.
++  int table_size = (n < 2048) ? 4 * nextPow2 : 2 * nextPow2;
++  if (table_size < 512) {
++    table_size = 512;
++  }
++  int num_funcs = 3;
++  auto hash_table = new HashTable{
++      .table = std::make_unique<CuckooHashTableCuda_Multi>(
++          table_size, 8 * ceil(log2((double)n)), num_funcs),
++      .key = torch::zeros(
++          {num_funcs * table_size},
++          at::device(hash_target.device()).dtype(at::ScalarType::Long)),
++      .val = torch::zeros(
++          {num_funcs * table_size},
++          at::device(hash_target.device()).dtype(at::ScalarType::Long))};
++  at::Tensor key_buf = torch::zeros(
++      {table_size},
++      at::device(hash_target.device()).dtype(at::ScalarType::Long));
++  at::Tensor val_buf = torch::zeros(
++      {table_size},
++      at::device(hash_target.device()).dtype(at::ScalarType::Long));
++
++  hash_table->table->insert_vals(
++      (uint64_t *)(hash_target.data_ptr<int64_t>()),
++      (uint64_t *)(idx_target.data_ptr<int64_t>()),
++      (uint64_t *)(key_buf.data_ptr<int64_t>()),
++      (uint64_t *)(val_buf.data_ptr<int64_t>()),
++      (uint64_t *)(hash_table->key.data_ptr<int64_t>()),
++      (uint64_t *)(hash_table->val.data_ptr<int64_t>()), n);
++  return hash_table;
++}
++
++void release_hash_table(void *ptr) {
++  delete reinterpret_cast<HashTable *>(ptr);
++}
++
++at::Tensor query_hash_table(void *ptr, const at::Tensor hash_query) {
++  auto hash_table = reinterpret_cast<HashTable *>(ptr);
++
++  int n1 = hash_query.size(0);
++
++  at::Tensor out = torch::zeros(
++      {n1}, at::device(hash_query.device()).dtype(at::ScalarType::Long));
++
++  hash_table->table->lookup_vals(
++      (uint64_t *)(hash_query.data_ptr<int64_t>()),
++      (uint64_t *)(hash_table->key.data_ptr<int64_t>()),
++      (uint64_t *)(hash_table->val.data_ptr<int64_t>()),
++      (uint64_t *)(out.data_ptr<int64_t>()), n1);
++  return out;
++}
++
+ at::Tensor hash_query_cuda(const at::Tensor hash_query,
+                            const at::Tensor hash_target,
+                            const at::Tensor idx_target) {
+diff --git a/torchsparse/backend/others/query_cuda.h b/torchsparse/backend/others/query_cuda.h
+index b445748..f38922c 100644
+--- a/torchsparse/backend/others/query_cuda.h
++++ b/torchsparse/backend/others/query_cuda.h
+@@ -5,3 +5,10 @@
+ at::Tensor hash_query_cuda(const at::Tensor hash_query,
+                            const at::Tensor hash_target,
+                            const at::Tensor idx_target);
++
++void *acquire_hash_table(const at::Tensor hash_target,
++                         const at::Tensor idx_target);
++
++void release_hash_table(void *ptr);
++
++at::Tensor query_hash_table(void *ptr, const at::Tensor hash_query);
+diff --git a/torchsparse/backend/pybind_cuda.cpp b/torchsparse/backend/pybind_cuda.cpp
+index 26e8b3b..0d1b6cf 100644
+--- a/torchsparse/backend/pybind_cuda.cpp
++++ b/torchsparse/backend/pybind_cuda.cpp
+@@ -36,6 +36,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+   m.def("kernel_hash_cuda", &kernel_hash_cuda);
+   m.def("hash_query_cpu", &hash_query_cpu);
+   m.def("hash_query_cuda", &hash_query_cuda);
++  m.def("acquire_hash_table", &acquire_hash_table);
++  m.def("release_hash_table", &release_hash_table);
++  m.def("query_hash_table", &query_hash_table);
+   m.def("build_kernel_map_subm", &build_kernel_map_subm);
+   m.def("build_kernel_map_downsample", &build_kernel_map_downsample);
+   m.def("build_mask_from_kmap", &build_mask_from_kmap);
+diff --git a/torchsparse/nn/functional/build_kmap.py b/torchsparse/nn/functional/build_kmap.py
+index 37d5f41..9b82724 100644
+--- a/torchsparse/nn/functional/build_kmap.py
++++ b/torchsparse/nn/functional/build_kmap.py
+@@ -6,10 +6,20 @@ import torchsparse.backend
+ from torchsparse.nn import functional as F
+ from torchsparse.nn.utils import get_kernel_offsets
+ from torchsparse.utils import make_ntuple
++from torchsparse.utils.quantize import ravel_hash
+ 
+ __all__ = ['build_kernel_map']
+ 
+ 
++def unique(x, dim=0):
++    unique, inverse, counts = torch.unique(x, dim=dim,
++                                           sorted=True, return_inverse=True, return_counts=True)
++    inv_sorted = inverse.argsort(stable=True)
++    tot_counts = torch.cat((counts.new_zeros(1), counts.cumsum(dim=0)))[:-1]
++    index = inv_sorted[tot_counts]
++    return unique, inverse, counts, index
++
++
+ def build_kernel_map(_coords: torch.Tensor,
+                      kernel_size: Union[int, Tuple[int, ...]] = 2,
+                      stride: Union[int, Tuple[int, ...]] = 2,
+@@ -52,7 +62,18 @@ def build_kernel_map(_coords: torch.Tensor,
+         kernel_size = make_ntuple(kernel_size, ndim=3)
+         stride = make_ntuple(stride, ndim=3)
+         if any(s > 1 for s in stride):
+-            coords = F.spdownsample(_coords, stride, kernel_size, tensor_stride)
++            coords = _coords.clone()
++            stride_tensor = torch.tensor([a * b for a, b in zip(stride, tensor_stride)],
++                                         device=coords.device, dtype=coords.dtype)
++            coords = torch.concat([coords[:, -1, None], coords[:, :-1] // stride_tensor * stride_tensor], axis=1)
++
++            coords_hash = F.sphash(coords)
++            _, _, _, index = unique(coords_hash) 
++            from minuet.nn import functional as MF
++            
++            coords = coords[index]
++            coords = torch.concat([coords[:, 1:], coords[:, 0, None]], axis=1)
++            # coords = F.spdownsample(_coords, stride, kernel_size, tensor_stride)
+         else:
+             coords = _coords
+         queries = F.sphash(coords, offsets)
+diff --git a/torchsparse/nn/functional/query.py b/torchsparse/nn/functional/query.py
+index 913047d..c696851 100644
+--- a/torchsparse/nn/functional/query.py
++++ b/torchsparse/nn/functional/query.py
+@@ -2,7 +2,7 @@ import torch
+ 
+ import torchsparse.backend
+ 
+-__all__ = ['sphashquery']
++__all__ = ['sphashquery', 'HashTable']
+ 
+ 
+ def sphashquery(queries: torch.Tensor,
+@@ -31,3 +31,27 @@ def sphashquery(queries: torch.Tensor,
+ 
+     output = (output - 1).view(*sizes)
+     return output
++
++
++class HashTable(object):
++
++    def __init__(self, references: torch.Tensor):
++        references = references.contiguous()
++        indices = torch.arange(len(references),
++                               device=references.device,
++                               dtype=torch.long)
++        if references.device.type == "cuda":
++            self._handle = torchsparse.backend.acquire_hash_table(
++                references, indices)
++        else:
++            raise NotImplementedError(references.device)
++
++    def query(self, queries: torch.Tensor):
++        sizes = queries.size()
++        queries = queries.contiguous().view(-1)
++        output = torchsparse.backend.query_hash_table(self._handle, queries)
++        output = (output - 1).view(*sizes)
++        return output
++
++    def close(self):
++        torchsparse.backend.release_hash_table(self._handle)
+diff --git a/utils/gather_build_info.py b/utils/gather_build_info.py
+new file mode 100644
+index 0000000..3a9794f
+--- /dev/null
++++ b/utils/gather_build_info.py
+@@ -0,0 +1,13 @@
++import os
++import torch
++import packaging.version
++
++try:
++  import pybind11
++  print(os.path.join(os.path.dirname(os.path.abspath(pybind11.__file__)), "share", "cmake"))
++except ImportError:
++  print(None)
++
++print(torch.utils.cmake_prefix_path)
++print(torch.cuda.is_available())
++print(packaging.version.parse(torch.version.cuda).major)

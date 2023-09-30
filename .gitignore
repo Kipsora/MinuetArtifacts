@@ -30,3 +30,14 @@
 *.exe
 *.out
 *.app
+
+# CLion project files
+/.idea
+cmake-build-*
+build
+/venv
+*.egg-info
+/.python-version
+*.pyc
+__pycache__
+/.cache

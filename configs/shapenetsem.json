@@ -1,0 +1,5 @@
+{
+  "dataset": "BinvoxDataset",
+  "root": "data/shapenet/ShapeNetSem-backup/models-binvox",
+  "num_points": 65536
+}
