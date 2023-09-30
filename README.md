@@ -1,5 +1,7 @@
 # EuroSys 2024 Artifact Evaluation
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.8393982.svg)](https://doi.org/10.5281/zenodo.8393982)
+
 In this repository, we provide the artifact for the paper 
 **Minuet: Accelerating 3D Sparse Convolution on GPUs**.
 
